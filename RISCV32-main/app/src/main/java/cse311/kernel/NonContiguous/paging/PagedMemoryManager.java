@@ -27,6 +27,10 @@ public class PagedMemoryManager extends MemoryManager {
     private AddressSpace current = null;
     private Pager pager = null; // Policy implementation
 
+    // Shared Memory
+    private Map<Integer, Integer> sharedKeyMap = new HashMap<>(); // Key (user provided) -> Frame Index
+    private int[] frameRefCount;
+
     // Physical UART mapping
     private static final int UART_BASE = 0x10000000;
     private static final int UART_SIZE = 0x1000;
@@ -41,6 +45,7 @@ public class PagedMemoryManager extends MemoryManager {
         this.freeFrames = new BitSet(totalFrames);
         this.reverseMap = new FrameOwner[totalFrames];
         this.freeFrames.set(0, totalFrames); // all free
+        this.frameRefCount = new int[totalFrames];
     }
 
     /**
@@ -205,12 +210,10 @@ public class PagedMemoryManager extends MemoryManager {
         ensurePager();
         int frame = pager.ensureResident(current, va, VmAccess.WRITE);
 
-        // --- FIX START ---
         if (frame == -2) {
             super.writeWord(va, v);
             return;
         }
-        // --- FIX END ---
 
         int pa = (frame << 12) | (va & 0xFFF);
         super.writeWord(pa, v);
@@ -249,6 +252,7 @@ public class PagedMemoryManager extends MemoryManager {
         int frame = freeFrames.nextSetBit(0);
         if (frame != -1) {
             freeFrames.clear(frame);
+            frameRefCount[frame] = 1; // Default to 1 owner
             return frame;
         }
         return -1; // out of memory
@@ -265,13 +269,61 @@ public class PagedMemoryManager extends MemoryManager {
 
     public void freeFrame(int frame) {
         if (frame >= 0 && frame < totalFrames) {
-            freeFrames.set(frame);
-            reverseMap[frame] = null;
+            // Decrease reference count
+            frameRefCount[frame]--;
 
-            // Clean up page table mappings
-            pageTableFrames.remove(frame);
-            pageDirectoryFrames.remove(frame);
+            // Only free when no one is using it (refCount <= 0)
+            if (frameRefCount[frame] <= 0) {
+                freeFrames.set(frame);
+                reverseMap[frame] = null;
+                pageTableFrames.remove(frame);
+                pageDirectoryFrames.remove(frame);
+
+                // If frame is in shared map, remove it
+                sharedKeyMap.values().removeIf(val -> val == frame);
+            }
         }
+    }
+
+    public int openSharedRegion(int key) {
+        // If key already exists, return old frame
+        if (sharedKeyMap.containsKey(key)) {
+            return sharedKeyMap.get(key);
+        }
+
+        // If not, create new frame
+        int newFrame = allocateFrame();
+        if (newFrame != -1) {
+            sharedKeyMap.put(key, newFrame);
+            // Zero-fill the new frame
+            for (int i = 0; i < PAGE_SIZE; i++) {
+                try {
+                    writeByteToPhysicalAddress((newFrame << 12) + i, (byte) 0);
+                } catch (Exception e) {
+                }
+            }
+        }
+        return newFrame;
+    }
+
+    // Manually map shared memory (set shared = true)
+    public boolean mapSharedPage(AddressSpace as, int vpn, int frame, boolean write) {
+        // Call internal mapPageInternal (assume you have access or modify visibility)
+        // Or modify mapPage to accept shared parameter
+
+        // Simplest way: Map normally then modify shared flag
+        boolean success = as.mapPage(vpn, frame, write, false); // No Exec
+        if (success) {
+            // Increase refCount because another page table points to this frame
+            frameRefCount[frame]++;
+
+            // Set shared flag in PTE
+            AddressSpace.PageTableEntry pte = as.getPTEInternal(vpn); // Need to expose this function or write logic to
+                                                                      // find PTE
+            if (pte != null)
+                pte.shared = true;
+        }
+        return success;
     }
 
     public FrameOwner getFrameOwner(int frame) {
@@ -350,6 +402,7 @@ public class PagedMemoryManager extends MemoryManager {
                 continue;
             }
 
+            // Iterate over Page Table (Level 2)
             for (int l2Index = 0; l2Index < 1024; l2Index++) {
                 AddressSpace.PageTableEntry pte = l2Table.entries[l2Index];
 
@@ -357,34 +410,62 @@ public class PagedMemoryManager extends MemoryManager {
                     continue;
                 }
 
-                int newFrame = allocateFrame();
-                if (newFrame < 0) {
-                    throw new MemoryAccessException("copyAddressSpace: out of physical memory");
-                }
-
-                int oldFrame = pte.ppn;
-                int oldPa = oldFrame << 12;
-                int newPa = newFrame << 12;
-
-                try {
-                    for (int i = 0; i < PAGE_SIZE; i++) {
-                        byte b = super.readByte(oldPa + i);
-                        super.writeByte(newPa + i, b);
-                    }
-                } catch (MemoryAccessException e) {
-                    freeFrame(newFrame);
-                    throw new MemoryAccessException("copyAddressSpace: failed to copy frame data: " + e.getMessage());
-                }
-
                 int vpn = (l1Index << 10) | l2Index;
-                boolean mapped = newAS.mapPage(vpn, newFrame, pte.W, pte.X);
+                int oldFrame = pte.ppn; // Physical frame of parent
 
-                if (!mapped) {
-                    freeFrame(newFrame);
-                    throw new MemoryAccessException("copyAddressSpace: mapPage failed for child");
+                // --- CHECK: IF IT'S A SHARED PAGE ---
+                if (pte.shared) {
+                    // 1. Do not allocate new frame.
+                    // 2. Map VPN of child directly to old frame of parent.
+                    boolean mapped = newAS.mapPage(vpn, oldFrame, pte.W, pte.X);
+
+                    if (mapped) {
+                        // Mark PTE of child as shared
+                        AddressSpace.PageTableEntry childPTE = newAS.getPTEInternal(vpn);
+                        if (childPTE != null)
+                            childPTE.shared = true;
+
+                        // Increase reference count for this frame
+                        frameRefCount[oldFrame]++;
+                    } else {
+                        throw new MemoryAccessException("copyAddressSpace: failed to map shared page");
+                    }
+
+                } else {
+                    // --- CASE: NOT SHARED (PRIVATE) -> OLD LOGIC ---
+
+                    // 1. Allocate new frame for child
+                    int newFrame = allocateFrame();
+                    if (newFrame < 0) {
+                        throw new MemoryAccessException("copyAddressSpace: out of physical memory");
+                    }
+
+                    // 2. Calculate physical addresses to copy data
+                    int oldPa = oldFrame << 12; // Source physical address
+                    int newPa = newFrame << 12; // Destination physical address
+
+                    try {
+                        // Deep Copy each byte from parent to child
+                        for (int i = 0; i < PAGE_SIZE; i++) {
+                            byte b = super.readByte(oldPa + i);
+                            super.writeByte(newPa + i, b);
+                        }
+                    } catch (MemoryAccessException e) {
+                        freeFrame(newFrame);
+                        throw new MemoryAccessException(
+                                "copyAddressSpace: failed to copy frame data: " + e.getMessage());
+                    }
+
+                    // 3. Map frame mới vào bảng trang của con
+                    boolean mapped = newAS.mapPage(vpn, newFrame, pte.W, pte.X);
+
+                    if (!mapped) {
+                        freeFrame(newFrame);
+                        throw new MemoryAccessException("copyAddressSpace: mapPage failed for child");
+                    }
+
+                    setFrameOwner(newFrame, new FrameOwner(newAS.getPid(), vpn));
                 }
-
-                setFrameOwner(newFrame, new FrameOwner(newAS.getPid(), vpn));
             }
         }
         System.out.println("PagedMemoryManager: Finished copying address space.");

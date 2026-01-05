@@ -10,6 +10,7 @@ import cse311.programs.InitTask;
 import java.io.File;
 
 public class App {
+    public static final String file_seperator = System.getProperty("file.separator");
 
     public static void main(String[] args) {
         System.out.println("==========================================");
@@ -21,7 +22,7 @@ public class App {
             // 1. HARDWARE INIT
             // --------------------------------------------------------
             // Initialize 128MB RAM, CPU, Memory Management Techniques
-            RV32iComputer computer = new RV32iComputer(128 * 1024 * 1024, 100, MemoryMode.CONTIGUOUS);
+            RV32Computer computer = new RV32Computer(128 * 1024 * 1024, 100, MemoryMode.CONTIGUOUS);
             Kernel kernel = computer.getKernel();
 
             // --------------------------------------------------------
@@ -29,29 +30,26 @@ public class App {
             // --------------------------------------------------------
             // Use Round Robin to allow Init, Shell, and User apps to share CPU
             kernel.getConfig().setSchedulerType(KernelConfig.SchedulerType.ROUND_ROBIN);
-            // 2000 instructions per slice gives the feeling of responsiveness
-            kernel.getConfig().setTimeSlice(2000);
+            // 5 instructions per slice
+            kernel.getConfig().setTimeSlice(5);
 
             // --------------------------------------------------------
             // 3. LAUNCH INIT PROCESS (PID 1)
+            // Java Simulated Init Task or from ELF
             // --------------------------------------------------------
             System.out.println("Bootloader: Spawning Init process (PID 1)...");
-
+            // First Option: Simulated Init (Not tested yet)
             // We only need to create InitTask manually.
             // The InitTask code (InitTask.java) will automatically detect
             // that the Shell is missing and spawn ShellTask for us.
             // InitTask initTask = new InitTask(1, kernel);
             // kernel.addTaskToScheduler(initTask);
 
-            // --------------------------------------------------------
-            // 4. (OPTIONAL) PRE-LOAD ELF
-            // --------------------------------------------------------
-            // If you pass a filename (e.g., "program.elf"), we load it now.
+            // Second Option: Loading Init.elf
+            // Pass a filename (e.g., "init.elf"), we load it now.
             // This is like adding a service to startup scripts.
 
-            // Test
-            // if (args.length > 0) {
-            String elfPath = "User_Program_ELF\\init.elf";
+            String elfPath = "User_Program_ELF" + file_seperator + "init.elf";
             System.out.println("Current working directory: " + System.getProperty("user.dir"));
             System.out.println("Looking for ELF at: " + elfPath);
             File f = new File(elfPath);
@@ -64,7 +62,7 @@ public class App {
             // }
 
             // --------------------------------------------------------
-            // 5. START KERNEL
+            // 4. START KERNEL
             // --------------------------------------------------------
             // This blocks forever in the mainLoop().
             // 1. Scheduler picks InitTask -> InitTask spawns ShellTask

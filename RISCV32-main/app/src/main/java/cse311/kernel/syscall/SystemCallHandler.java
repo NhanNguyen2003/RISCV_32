@@ -9,8 +9,10 @@ import cse311.*;
 import cse311.Exception.ElfException;
 import cse311.Exception.MemoryAccessException;
 import cse311.kernel.Kernel;
+import cse311.kernel.NonContiguous.paging.AddressSpace;
 import cse311.kernel.NonContiguous.paging.PagedMemoryManager;
 import cse311.kernel.memory.ProcessMemoryCoordinator;
+import cse311.kernel.process.ProgramInfo;
 import cse311.kernel.process.Task;
 import cse311.kernel.process.TaskState;
 
@@ -22,7 +24,7 @@ import cse311.kernel.process.TaskState;
  */
 public class SystemCallHandler {
     private final Kernel kernel;
-    private RV32iCpu cpu;
+    private RV32Cpu cpu;
 
     // System call numbers (following Linux RISC-V convention)
     public static final int SYS_EXIT = 93;
@@ -39,7 +41,7 @@ public class SystemCallHandler {
     public static final int SYS_GET_TIME = 1001;
     public static final int SYS_SLEEP = 1002;
 
-    public SystemCallHandler(Kernel kernel, RV32iCpu cpu) {
+    public SystemCallHandler(Kernel kernel, RV32Cpu cpu) {
         this.kernel = kernel;
         this.cpu = cpu;
     }
@@ -110,6 +112,45 @@ public class SystemCallHandler {
 
                 case SYS_SLEEP:
                     result = handleSleep(task, arg0);
+                    break;
+
+                // Add case to switch(syscallNum)
+                case 20: // SYS_SHM_OPEN (a0 = key) -> returns shmid (frame index)
+                    // Get parameter from register a0 (register 10) of task
+                    int key = (int) task.getRegisters()[10];
+                    // Access Memory Manager from Kernel
+                    if (kernel.getMemory() instanceof cse311.kernel.NonContiguous.paging.PagedMemoryManager) {
+                        PagedMemoryManager pmm = (PagedMemoryManager) kernel.getMemory();
+
+                        int frameId = pmm.openSharedRegion(key);
+                        task.getRegisters()[10] = frameId; // Return result to a0
+                    } else {
+                        task.getRegisters()[10] = -1; // Error: Not Paging mode
+                    }
+                    break;
+
+                case 21: // SYS_SHM_ATTACH (a0 = shmid, a1 = vaddr)
+                    // Get parameters a0 (frameId) and a1 (virtualAddr)
+                    int frameToMap = (int) task.getRegisters()[10];
+                    int virtualAddr = (int) task.getRegisters()[11];
+
+                    if (kernel.getMemory() instanceof PagedMemoryManager) {
+                        PagedMemoryManager pmm = (PagedMemoryManager) kernel.getMemory();
+
+                        // Get AddressSpace of current task (based on PID)
+                        AddressSpace currentAS = pmm.getAddressSpace(task.getId());
+
+                        if (currentAS != null) {
+                            int vpn = virtualAddr / 4096;
+                            // Map frame to address space with Write permission
+                            boolean success = pmm.mapSharedPage(currentAS, vpn, frameToMap, true);
+                            task.getRegisters()[10] = success ? 0 : -1;
+                        } else {
+                            task.getRegisters()[10] = -1;
+                        }
+                    } else {
+                        task.getRegisters()[10] = -1;
+                    }
                     break;
 
                 default:
@@ -276,7 +317,8 @@ public class SystemCallHandler {
                 kernel.getTaskManager().cleanupTask(child);
                 kernel.getAllTasks().remove(child);
 
-                System.out.println("SYS_WAIT: Cleaned up child " + childPid + " with exit code " + exitCode);
+                // System.out.println("SYS_WAIT: Cleaned up child " + childPid + " with exit
+                // code " + exitCode);
                 return childPid; // Return the PID of the child we just cleaned up
             }
         }
@@ -313,7 +355,7 @@ public class SystemCallHandler {
         String path = readStringFromTask(task, pathPtr);
         if (path == null)
             return -1;
-        String fullPath = "User_Program_ELF\\" + path + ".elf";
+        String fullPath = "User_Program_ELF" + App.file_seperator + path + ".elf";
 
         // Read argv (Logic remains same, just using generic memory)
         List<String> argvList = new ArrayList<>();
@@ -369,7 +411,7 @@ public class SystemCallHandler {
             var layout = coordinator.allocateMemory(task.getId(), requiredSize);
 
             // Load new program
-            int newEntryPoint = coordinator.loadProgram(task.getId(), elfData);
+            ProgramInfo newInfo = coordinator.loadProgram(task.getId(), elfData);
 
             // 4. Setup Stack (Delegated!)
             // This works for Paging AND Contiguous now
@@ -377,7 +419,8 @@ public class SystemCallHandler {
 
             // 5. Update Task
             task.setName(path);
-            task.setProgramCounter(newEntryPoint);
+            task.setProgramCounter(newInfo.entryPoint);
+            task.setProgramInfo(newInfo);
             task.setStackBase(layout.stackBase);
             task.setStackSize(layout.stackSize);
             task.setAllocatedSize(requiredSize);
